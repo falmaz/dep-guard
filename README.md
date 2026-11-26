@@ -42,13 +42,13 @@ dep-guard --strict .               # Exit 1 on WARN as well as BLOCK
 dep-guard --init-assets .          # Scaffold ASSETS_LICENSES.json for existing fonts/assets
 ```
 
-### Add to GitHub Actions (optional)
+### Add to GitHub Actions (GitHub Marketplace)
 ```yaml
-- name: License & Asset Audit
-  run: |
-    git clone --depth 1 https://github.com/falmaz/dep-guard.git /tmp/dep-guard
-    /tmp/dep-guard/bin/dep-guard --online .
+- uses: falmaz/dep-guard@v0.3.0
+  with:
+    online: true
 ```
+Optional inputs: `path`, `online`, `deep`, `strict`, `include-dev`, `policy`, `install-trivy`. Outputs: `block-count`, `warn-count`.
 
 ### Customizing Policy
 Drop a `.dep-guard.json` in your project root (using [`policy.json`](./policy.json) as a template) to override allowed/blocked SPDX licenses, commercial font patterns, excluded paths, or CDN allowlists.

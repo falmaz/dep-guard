@@ -15,5 +15,7 @@ jobs:
           python-version: "3.11"
       - name: Run unit tests
         run: python3 -m unittest -v tests/test_dep_guard.py
-      - name: Self-scan
-        run: ./bin/dep-guard .
+      - name: Self-scan via composite action
+        uses: ./
+        with:
+          install-trivy: false

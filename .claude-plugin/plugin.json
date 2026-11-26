@@ -1,6 +1,6 @@
 {
   "name": "dep-guard",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "description": "Deterministic Trivy-backed license, font, asset & CDN compliance guardrails for builders (Claude Code, Codex, Antigravity).",
   "author": {
     "name": "falmaz"

@@ -1,0 +1,99 @@
+name: "dep-guard"
+description: "Deterministic Trivy-backed license, font, asset & CDN compliance guardrails for commercial software"
+author: "falmaz"
+
+branding:
+  icon: "shield"
+  color: "blue"
+
+inputs:
+  path:
+    description: "Directory to scan"
+    required: false
+    default: "."
+  online:
+    description: "Resolve unscanned requirements.txt / yarn / pnpm manifests via deps.dev API"
+    required: false
+    default: "false"
+  deep:
+    description: "Enable Trivy --license-full source-level license scanning"
+    required: false
+    default: "false"
+  strict:
+    description: "Fail the workflow on WARN findings in addition to BLOCK findings"
+    required: false
+    default: "false"
+  include-dev:
+    description: "Include devDependencies and test/e2e paths"
+    required: false
+    default: "false"
+  policy:
+    description: "Optional path to a custom policy.json"
+    required: false
+    default: ""
+  install-trivy:
+    description: "Install Trivy automatically if not present on the runner"
+    required: false
+    default: "true"
+
+outputs:
+  block-count:
+    description: "Number of BLOCK findings"
+    value: ${{ steps.scan.outputs.block_count }}
+  warn-count:
+    description: "Number of WARN findings"
+    value: ${{ steps.scan.outputs.warn_count }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Install Trivy (optional)
+      if: inputs.install-trivy == 'true'
+      shell: bash
+      run: |
+        if ! command -v trivy >/dev/null 2>&1; then
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin
+        fi
+
+    - name: Run dep-guard
+      id: scan
+      shell: bash
+      env:
+        DG_PATH: ${{ inputs.path }}
+        DG_ONLINE: ${{ inputs.online }}
+        DG_DEEP: ${{ inputs.deep }}
+        DG_STRICT: ${{ inputs.strict }}
+        DG_INCLUDE_DEV: ${{ inputs.include-dev }}
+        DG_POLICY: ${{ inputs.policy }}
+      run: |
+        args=()
+        [[ "$DG_ONLINE" == "true" ]] && args+=(--online)
+        [[ "$DG_DEEP" == "true" ]] && args+=(--deep)
+        [[ "$DG_STRICT" == "true" ]] && args+=(--strict)
+        [[ "$DG_INCLUDE_DEV" == "true" ]] && args+=(--include-dev)
+        [[ -n "$DG_POLICY" ]] && args+=(--policy "$DG_POLICY")
+
+        set +e
+        python3 "${{ github.action_path }}/bin/dep-guard" --format json "${args[@]}" "$DG_PATH" > /tmp/dep-guard-report.json
+        exit_code=$?
+        set -e
+
+        python3 - <<'PY'
+        import json, os
+        data = json.load(open("/tmp/dep-guard-report.json"))
+        blocks = [f for f in data.get("findings", []) if f["severity"] == "BLOCK"]
+        warns = [f for f in data.get("findings", []) if f["severity"] == "WARN"]
+        with open(os.environ["GITHUB_OUTPUT"], "a") as out:
+            out.write(f"block_count={len(blocks)}\n")
+            out.write(f"warn_count={len(warns)}\n")
+        engine = "Trivy + asset-scan" if data.get("trivy_available") else "lockfile-fallback + asset-scan"
+        print(f"dep-guard scan ({engine}) -> {len(blocks)} BLOCK, {len(warns)} WARN")
+        for f in blocks:
+            print(f"::error title=dep-guard BLOCK::{f['target']} ({f['license']}) — {f['reason']}")
+        for f in warns:
+            print(f"::warning title=dep-guard WARN::{f['target']} ({f['license']}) — {f['reason']}")
+        for g in data.get("coverage_gaps") or []:
+            print(f"::notice title=dep-guard coverage gap::{g['file']} ({g['ecosystem']}) — {g['hint']}")
+        PY
+
+        exit "$exit_code"

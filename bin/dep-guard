@@ -22,6 +22,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import zlib
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -791,23 +792,37 @@ def resolve_online_deps_dev(
                         seen_pkgs.add(("npm", name.lower()))
                         to_query.append(("npm", name, ver, rel))
 
-    for system, name, ver, source_file in to_query[:max_packages]:
+    batch = to_query[:max_packages]
+    if not batch:
+        return findings
+
+    def _check_one(item: tuple[str, str, str | None, str]) -> Finding | None:
+        system, name, ver, source_file = item
         licenses = query_deps_dev_licenses(system, name, ver)
         if not licenses:
-            continue
+            return None
         expr = " AND ".join(licenses) if len(licenses) > 1 else licenses[0]
         verdict = classify_license(expr, policy)
-        if verdict:
-            findings.append(
-                Finding(
-                    severity=verdict,
-                    category="dependency",
-                    target=name,
-                    license=expr,
-                    reason=f"License '{expr}' resolved via deps.dev for {source_file}",
-                    source="deps.dev",
-                )
-            )
+        if not verdict:
+            return None
+        return Finding(
+            severity=verdict,
+            category="dependency",
+            target=name,
+            license=expr,
+            reason=f"License '{expr}' resolved via deps.dev for {source_file}",
+            source="deps.dev",
+        )
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        futures = [pool.submit(_check_one, item) for item in batch]
+        for fut in as_completed(futures):
+            try:
+                res = fut.result()
+                if res:
+                    findings.append(res)
+            except Exception:
+                continue
     return findings
 
 
