@@ -42,9 +42,9 @@ dep-guard --strict .               # Exit 1 on WARN as well as BLOCK
 dep-guard --init-assets .          # Scaffold ASSETS_LICENSES.json for existing fonts/assets
 ```
 
-### Add to GitHub Actions (GitHub Marketplace)
+### Add to GitHub Actions (GitHub Marketplace — DMCA Guard)
 ```yaml
-- uses: falmaz/dep-guard@v0.3.0
+- uses: falmaz/dep-guard@v0.3.1
   with:
     online: true
 ```

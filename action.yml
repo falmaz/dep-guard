@@ -1,4 +1,4 @@
-name: "dep-guard"
+name: "DMCA Guard"
 description: "Deterministic Trivy-backed license, font, asset & CDN compliance guardrails for commercial software"
 author: "falmaz"
 
