@@ -1,0 +1,11 @@
+{
+  "dep-guard": {
+    "Stop": [
+      {
+        "type": "command",
+        "command": "python3 ./agy_hook.py",
+        "timeout": 60
+      }
+    ]
+  }
+}

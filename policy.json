@@ -1,0 +1,161 @@
+{
+  "version": "1",
+  "description": "Default commercial-safe license & asset policy for SaaS / commercial software.",
+  "licenses": {
+    "blocked": [
+      "CC-BY-NC-1.0",
+      "CC-BY-NC-2.0",
+      "CC-BY-NC-2.5",
+      "CC-BY-NC-3.0",
+      "CC-BY-NC-4.0",
+      "CC-BY-NC-SA-1.0",
+      "CC-BY-NC-SA-2.0",
+      "CC-BY-NC-SA-2.5",
+      "CC-BY-NC-SA-3.0",
+      "CC-BY-NC-SA-4.0",
+      "CC-BY-NC-ND-1.0",
+      "CC-BY-NC-ND-2.0",
+      "CC-BY-NC-ND-2.5",
+      "CC-BY-NC-ND-3.0",
+      "CC-BY-NC-ND-4.0",
+      "AGPL-1.0",
+      "AGPL-3.0",
+      "AGPL-3.0-only",
+      "AGPL-3.0-or-later",
+      "SSPL-1.0",
+      "Commons-Clause",
+      "WTFPL-NC",
+      "JSON",
+      "BUSL-1.1"
+    ],
+    "blocked_patterns": [
+      "BY-NC",
+      "NON-COMMERCIAL",
+      "NONCOMMERCIAL",
+      "PERSONAL USE ONLY",
+      "NOT FOR COMMERCIAL",
+      "PROPRIETARY",
+      "AGPL",
+      "SSPL"
+    ],
+    "warn": [
+      "GPL-2.0",
+      "GPL-2.0-only",
+      "GPL-2.0-or-later",
+      "GPL-3.0",
+      "GPL-3.0-only",
+      "GPL-3.0-or-later",
+      "LGPL-2.1",
+      "LGPL-3.0",
+      "MPL-2.0",
+      "EPL-2.0",
+      "CC-BY-SA-4.0",
+      "UNKNOWN",
+      "UNLICENSED"
+    ],
+    "allowed": [
+      "MIT",
+      "MIT-0",
+      "MIT/X11",
+      "Apache-2.0",
+      "BSD-2-Clause",
+      "BSD-3-Clause",
+      "ISC",
+      "0BSD",
+      "Unlicense",
+      "CC0-1.0",
+      "CC-BY-4.0",
+      "OFL-1.1",
+      "Zlib",
+      "BSL-1.0",
+      "Python-2.0",
+      "PSF-2.0",
+      "Artistic-2.0",
+      "BlueOak-1.0.0"
+    ]
+  },
+  "scope": {
+    "skip_dev_dependencies": true,
+    "exclude_paths": [
+      "**/test/**",
+      "**/tests/**",
+      "**/__tests__/**",
+      "**/e2e/**",
+      "**/fixtures/**",
+      "**/*.test.*",
+      "**/*.spec.*"
+    ]
+  },
+  "assets": {
+    "require_manifest_for": [
+      ".ttf",
+      ".otf",
+      ".woff",
+      ".woff2",
+      ".parquet",
+      ".sqlite",
+      ".db"
+    ],
+    "scan_metadata_for": [
+      ".ttf",
+      ".otf",
+      ".woff",
+      ".svg",
+      ".css",
+      ".scss"
+    ],
+    "commercial_font_patterns": [
+      "MONOTYPE",
+      "LINOTYPE",
+      "ADOBE SYSTEMS",
+      "HOEFLER",
+      "COMMERCIAL TYPE",
+      "DALTON MAAG",
+      "ALL RIGHTS RESERVED"
+    ],
+    "open_font_markers": [
+      "SIL OPEN FONT LICENSE",
+      "OPEN FONT LICENSE",
+      "OFL-1.1",
+      "APACHE LICENSE",
+      "MIT LICENSE",
+      "CC0"
+    ],
+    "manifest_files": [
+      "ASSETS_LICENSES.json",
+      "REUSE.toml",
+      ".reuse/dep5"
+    ],
+    "ignore_dirs": [
+      ".git",
+      ".claude",
+      ".worktrees",
+      "node_modules",
+      ".venv",
+      "venv",
+      "__pycache__",
+      "dist",
+      "build",
+      ".next",
+      "target",
+      "vendor"
+    ]
+  },
+  "cdns": {
+    "allowed_hosts": [
+      "fonts.googleapis.com",
+      "fonts.gstatic.com",
+      "cdn.jsdelivr.net",
+      "unpkg.com",
+      "cdnjs.cloudflare.com"
+    ],
+    "flagged_hosts": [
+      "use.typekit.net",
+      "cloud.typography.com",
+      "fast.fonts.net",
+      "kit.fontawesome.com",
+      "pro.fontawesome.com",
+      "use.fontawesome.com"
+    ]
+  }
+}

@@ -1,0 +1,17 @@
+{
+  "description": "Run deterministic license & asset checks after package installs or manifest/asset edits.",
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Write|Edit|Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/cc_post_tool.py\"",
+            "timeout": 60
+          }
+        ]
+      }
+    ]
+  }
+}

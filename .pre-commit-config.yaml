@@ -1,0 +1,9 @@
+repos:
+  - repo: local
+    hooks:
+      - id: dep-guard
+        name: dep-guard license & asset compliance
+        entry: dep-guard .
+        language: system
+        pass_filenames: false
+        always_run: true

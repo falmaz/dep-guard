@@ -1,0 +1,23 @@
+{
+  "name": "dep-guard",
+  "version": "0.2.0",
+  "description": "Deterministic Trivy-backed license, font, asset & CDN compliance guardrails for builders (Claude Code, Codex, Antigravity).",
+  "author": {
+    "name": "falmaz"
+  },
+  "homepage": "https://github.com/falmaz/dep-guard",
+  "repository": "https://github.com/falmaz/dep-guard",
+  "license": "MIT",
+  "keywords": [
+    "trivy",
+    "license",
+    "spdx",
+    "compliance",
+    "dmca",
+    "security",
+    "sbom",
+    "claude-code",
+    "codex",
+    "antigravity"
+  ]
+}

@@ -1,0 +1,959 @@
+#!/usr/bin/env python3
+"""
+dep-guard: Deterministic license & asset compliance scanner for builders.
+
+Uses Trivy (`trivy fs --scanners license`) as the primary dependency engine when
+available, with a zero-dependency fallback parser for common lockfiles/manifests,
+plus deterministic checks for font/SVG metadata, asset provenance, and external CDNs.
+"""
+
+from __future__ import annotations
+
+import argparse
+import fnmatch
+import json
+import os
+import re
+import shutil
+import struct
+import subprocess
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+import zlib
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Any
+from urllib.parse import urlparse
+
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+DEFAULT_POLICY_PATH = SCRIPT_DIR.parent / "policy.json"
+
+SPDX_HEADER_RE = re.compile(r"SPDX-License-Identifier:\s*([A-Za-z0-9.\-+() ]+)")
+URL_RE = re.compile(r"https?://[^\s'\"<>()]+")
+VALID_HOST_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)+$")
+ASSET_URL_HINTS = (".ttf", ".otf", ".woff", ".woff2", ".eot", "fonts.", "typekit", "fontawesome", "typography")
+
+
+@dataclass
+class Finding:
+    severity: str  # "BLOCK" | "WARN"
+    category: str  # "dependency" | "font_metadata" | "asset_metadata" | "asset_provenance" | "source_header" | "external_cdn"
+    target: str
+    license: str
+    reason: str
+    source: str  # "trivy" | "lockfile" | "asset-scan" | "cdn-scan"
+
+
+def load_policy(policy_path: Path | None, target_dir: Path) -> dict[str, Any]:
+    candidates = []
+    if policy_path:
+        candidates.append(policy_path)
+    candidates.append(target_dir / ".dep-guard.json")
+    candidates.append(target_dir / "dep-guard.policy.json")
+    candidates.append(DEFAULT_POLICY_PATH)
+
+    for candidate in candidates:
+        if candidate.is_file():
+            with candidate.open("r", encoding="utf-8") as f:
+                return json.load(f)
+    raise FileNotFoundError(f"Could not locate policy.json (checked {candidates})")
+
+
+def classify_license(license_str: str, policy: dict[str, Any]) -> str | None:
+    """Return 'BLOCK', 'WARN', or None (allowed)."""
+    if not license_str or not license_str.strip():
+        return "WARN"
+
+    raw = license_str.strip()
+    upper = raw.upper()
+
+    # Normalize common legacy npm free-text dual-license strings (e.g. jquery-ui-touch-punch)
+    if "DUAL LICENSED" in upper and "MIT" in upper and " OR " in upper:
+        upper = "MIT OR GPL-2.0"
+
+    lic_cfg = policy.get("licenses", {})
+    blocked = {x.upper() for x in lic_cfg.get("blocked", [])}
+    warn = {x.upper() for x in lic_cfg.get("warn", [])}
+    allowed = {x.upper() for x in lic_cfg.get("allowed", [])}
+    blocked_patterns = [p.upper() for p in lic_cfg.get("blocked_patterns", [])]
+
+    # Split compound SPDX expressions conservatively (AND requires all, OR allows if any allowed)
+    if " OR " in upper:
+        parts = [p.strip("() ") for p in upper.split(" OR ")]
+        results = [classify_license(p, policy) for p in parts]
+        if None in results:
+            return None
+        if "WARN" in results:
+            return "WARN"
+        return "BLOCK"
+
+    if " AND " in upper:
+        parts = [p.strip("() ") for p in upper.split(" AND ")]
+        results = [classify_license(p, policy) for p in parts]
+        if "BLOCK" in results:
+            return "BLOCK"
+        if "WARN" in results:
+            return "WARN"
+        return None
+
+    cleaned = upper.strip("() ")
+    if cleaned in blocked:
+        return "BLOCK"
+    for pat in blocked_patterns:
+        if pat in cleaned:
+            return "BLOCK"
+    if cleaned in allowed:
+        return None
+    if cleaned in warn:
+        return "WARN"
+    # Unknown / custom license string -> warn so builder notices
+    return "WARN"
+
+
+def is_valid_public_host(host: str) -> bool:
+    """Return True only for syntactically valid multi-label DNS hostnames (rejects placeholders like ${attacker})."""
+    return bool(host and VALID_HOST_RE.match(host))
+
+
+def is_excluded_path(rel_path: str, policy: dict[str, Any], include_dev: bool) -> bool:
+    norm = rel_path.replace("\\", "/").lstrip("./")
+    parts = norm.split("/")
+
+    # Always skip ignored directories (e.g. .claude/worktrees, node_modules) even for Trivy results
+    ignore_dirs = set(policy.get("assets", {}).get("ignore_dirs", []))
+    if any(part in ignore_dirs for part in parts[:-1]):
+        return True
+
+    if include_dev:
+        return False
+
+    patterns = policy.get("scope", {}).get("exclude_paths", [])
+    filename = parts[-1] if parts else norm
+    for pat in patterns:
+        # Handle "**/segment/**" matching at any directory depth
+        if pat.startswith("**/") and pat.endswith("/**"):
+            seg = pat[3:-3].strip("/")
+            if seg and seg in parts[:-1]:
+                return True
+        # Handle "**/*.ext" / "**/*.test.*" matching filename at any depth
+        elif pat.startswith("**/"):
+            sub = pat[3:]
+            if fnmatch.fnmatch(filename, sub) or fnmatch.fnmatch(norm, sub):
+                return True
+        elif pat.endswith("/**"):
+            prefix = pat[:-3].rstrip("/")
+            if norm == prefix or norm.startswith(prefix + "/"):
+                return True
+        elif fnmatch.fnmatch(norm, pat):
+            return True
+    return False
+
+
+def get_git_ignored_dirs(target_dir: Path, candidates: list[str]) -> set[str]:
+    """Return subset of directory paths ignored by git (fast no-op if not a git repo)."""
+    if not candidates or not (target_dir / ".git").exists() or not shutil.which("git"):
+        return set()
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(target_dir), "check-ignore", "--stdin"],
+            input="\n".join(candidates) + "\n",
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if proc.returncode in (0, 1):
+            return {line.strip().rstrip("/") for line in proc.stdout.splitlines() if line.strip()}
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    return set()
+
+
+def run_trivy(
+    target_dir: Path, policy: dict[str, Any], deep: bool, include_dev: bool = False
+) -> tuple[bool, list[Finding], str | None]:
+    trivy_bin = shutil.which("trivy")
+    if not trivy_bin:
+        return False, [], "trivy not found in PATH (install via `brew install trivy` for full transitive & file-level scanning)"
+
+    cmd = [
+        trivy_bin,
+        "fs",
+        "--scanners",
+        "license",
+        "--format",
+        "json",
+        "--quiet",
+    ]
+    for skip_dir in (".claude", ".worktrees"):
+        if (target_dir / skip_dir).exists():
+            cmd.extend(["--skip-dirs", str(target_dir / skip_dir)])
+    if deep:
+        cmd.append("--license-full")
+    cmd.append(str(target_dir))
+
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    except subprocess.TimeoutExpired:
+        return True, [], "trivy timed out after 120s"
+    except OSError as exc:
+        return False, [], f"failed to invoke trivy: {exc}"
+
+    if proc.returncode != 0 and not proc.stdout.strip():
+        return True, [], f"trivy exited with {proc.returncode}: {proc.stderr.strip()}"
+
+    try:
+        data = json.loads(proc.stdout) if proc.stdout.strip() else {}
+    except json.JSONDecodeError as exc:
+        return True, [], f"failed to parse trivy JSON: {exc}"
+
+    findings: list[Finding] = []
+    seen: set[tuple[str, str, str]] = set()
+
+    for result in data.get("Results") or []:
+        res_target = result.get("Target", "")
+        if res_target and is_excluded_path(res_target, policy, include_dev):
+            continue
+        for lic in result.get("Licenses") or []:
+            file_path = lic.get("FilePath") or ""
+            if file_path and is_excluded_path(file_path, policy, include_dev):
+                continue
+            pkg = lic.get("PkgName") or file_path or res_target
+            lic_name = lic.get("Name") or "UNKNOWN"
+            trivy_cat = (lic.get("Category") or "").lower()
+
+            verdict = classify_license(lic_name, policy)
+            if verdict is None and trivy_cat == "forbidden":
+                verdict = "BLOCK"
+            elif verdict is None and trivy_cat == "restricted":
+                verdict = "WARN"
+
+            if verdict is None:
+                continue
+
+            key = (verdict, pkg, lic_name)
+            if key in seen:
+                continue
+            seen.add(key)
+
+            reason = (
+                f"Blocked license '{lic_name}' (Trivy category: {trivy_cat or 'n/a'}) in {res_target}"
+                if verdict == "BLOCK"
+                else f"Review license '{lic_name}' (Trivy category: {trivy_cat or 'n/a'}) in {res_target}"
+            )
+            findings.append(
+                Finding(
+                    severity=verdict,
+                    category="dependency",
+                    target=pkg,
+                    license=lic_name,
+                    reason=reason,
+                    source="trivy",
+                )
+            )
+
+    return True, findings, None
+
+
+def scan_lockfiles_fallback(
+    target_dir: Path, policy: dict[str, Any], include_dev: bool = False
+) -> list[Finding]:
+    """Zero-dependency fallback parser for package.json, package-lock.json, and pyproject.toml."""
+    findings: list[Finding] = []
+    seen: set[tuple[str, str]] = set()
+    ignore_dirs = set(policy.get("assets", {}).get("ignore_dirs", []))
+    skip_dev = policy.get("scope", {}).get("skip_dev_dependencies", True) and not include_dev
+
+    def add_if_flagged(pkg: str, lic: str, source_file: str, is_dev: bool = False) -> None:
+        if is_dev and skip_dev:
+            return
+        verdict = classify_license(lic, policy)
+        if not verdict:
+            return
+        key = (pkg, lic)
+        if key in seen:
+            return
+        seen.add(key)
+        dev_tag = " [dev-only]" if is_dev else ""
+        findings.append(
+            Finding(
+                severity=verdict,
+                category="dependency",
+                target=pkg,
+                license=lic or "UNKNOWN",
+                reason=f"License '{lic or 'UNKNOWN'}' flagged in {source_file}{dev_tag}",
+                source="lockfile",
+            )
+        )
+
+    for root, dirs, files in os.walk(target_dir):
+        root_path = Path(root)
+        dirs[:] = [d for d in dirs if d not in ignore_dirs]
+        rel_dirs = [str((root_path / d).relative_to(target_dir)) for d in dirs]
+        ignored_by_git = get_git_ignored_dirs(target_dir, rel_dirs)
+        if ignored_by_git:
+            dirs[:] = [d for d, rel_d in zip(dirs, rel_dirs) if rel_d not in ignored_by_git]
+
+        if "package-lock.json" in files:
+            lock_path = root_path / "package-lock.json"
+            rel_lock = str(lock_path.relative_to(target_dir))
+            if not is_excluded_path(rel_lock, policy, include_dev):
+                try:
+                    lock_data = json.loads(lock_path.read_text(encoding="utf-8"))
+                    packages = lock_data.get("packages") or {}
+                    for pkg_path, meta in packages.items():
+                        if not pkg_path or not isinstance(meta, dict):
+                            continue
+                        lic = meta.get("license")
+                        if isinstance(lic, dict):
+                            lic = lic.get("type", "")
+                        if lic:
+                            pkg_name = pkg_path.replace("node_modules/", "")
+                            add_if_flagged(pkg_name, str(lic), rel_lock, is_dev=bool(meta.get("dev")))
+                except (OSError, json.JSONDecodeError):
+                    pass
+
+        if "package.json" in files:
+            pkg_json = root_path / "package.json"
+            rel_pkg = str(pkg_json.relative_to(target_dir))
+            if not is_excluded_path(rel_pkg, policy, include_dev):
+                try:
+                    data = json.loads(pkg_json.read_text(encoding="utf-8"))
+                    lic = data.get("license")
+                    if isinstance(lic, dict):
+                        lic = lic.get("type", "")
+                    if lic and root_path != target_dir:
+                        add_if_flagged(data.get("name", rel_pkg), str(lic), rel_pkg)
+                except (OSError, json.JSONDecodeError):
+                    pass
+
+        if "pyproject.toml" in files:
+            pyproj = root_path / "pyproject.toml"
+            rel_py = str(pyproj.relative_to(target_dir))
+            if not is_excluded_path(rel_py, policy, include_dev):
+                try:
+                    text = pyproj.read_text(encoding="utf-8", errors="ignore")
+                    m = re.search(r'^\s*license\s*=\s*(?:\{\s*text\s*=\s*"([^"]+)"\s*\}|"([^"]+)")', text, re.M)
+                    if m and root_path != target_dir:
+                        lic = m.group(1) or m.group(2)
+                        add_if_flagged(rel_py, lic, rel_py)
+                except OSError:
+                    pass
+
+    return findings
+
+
+def parse_name_table_bytes(table_bytes: bytes) -> list[str]:
+    """Parse an OpenType/TrueType 'name' table and extract Copyright (0), License (13), License URL (14)."""
+    if len(table_bytes) < 6:
+        return []
+    _, count, string_offset = struct.unpack(">HHH", table_bytes[:6])
+    extracted: list[str] = []
+
+    for i in range(count):
+        rec_off = 6 + i * 12
+        if rec_off + 12 > len(table_bytes):
+            break
+        platform_id, _enc_id, _lang_id, name_id, length, str_off = struct.unpack(
+            ">HHHHHH", table_bytes[rec_off : rec_off + 12]
+        )
+        if name_id not in (0, 13, 14):
+            continue
+        raw = table_bytes[string_offset + str_off : string_offset + str_off + length]
+        if not raw:
+            continue
+        try:
+            text = raw.decode("utf-16-be") if platform_id in (0, 3) else raw.decode("latin-1")
+        except UnicodeDecodeError:
+            continue
+        cleaned = text.strip()
+        if cleaned and cleaned not in extracted:
+            extracted.append(cleaned)
+    return extracted
+
+
+def read_ttf_name_table(font_path: Path) -> list[str]:
+    """Extract copyright (ID 0) and license (ID 13, 14) strings from a TTF/OTF file using stdlib only."""
+    try:
+        data = font_path.read_bytes()
+    except OSError:
+        return []
+
+    if len(data) < 12:
+        return []
+
+    try:
+        _, num_tables = struct.unpack(">IH", data[:6])
+    except struct.error:
+        return []
+
+    for i in range(num_tables):
+        entry_off = 12 + i * 16
+        if entry_off + 16 > len(data):
+            break
+        tag = data[entry_off : entry_off + 4]
+        if tag == b"name":
+            _, offset, length = struct.unpack(">III", data[entry_off + 4 : entry_off + 16])
+            if offset + length <= len(data):
+                return parse_name_table_bytes(data[offset : offset + length])
+            return parse_name_table_bytes(data[offset:])
+    return []
+
+
+def read_woff_name_table(font_path: Path) -> list[str]:
+    """Extract copyright/license strings from a WOFF 1.0 font using stdlib zlib."""
+    try:
+        data = font_path.read_bytes()
+    except OSError:
+        return []
+
+    if len(data) < 44 or data[:4] != b"wOFF":
+        return []
+
+    try:
+        num_tables = struct.unpack(">H", data[12:14])[0]
+    except struct.error:
+        return []
+
+    for i in range(num_tables):
+        entry_off = 44 + i * 20
+        if entry_off + 20 > len(data):
+            break
+        tag = data[entry_off : entry_off + 4]
+        if tag == b"name":
+            offset, comp_len, orig_len, _checksum = struct.unpack(">IIII", data[entry_off + 4 : entry_off + 20])
+            raw = data[offset : offset + comp_len]
+            if comp_len < orig_len:
+                try:
+                    raw = zlib.decompress(raw)
+                except zlib.error:
+                    return []
+            return parse_name_table_bytes(raw)
+    return []
+
+
+def read_font_name_table(font_path: Path) -> list[str]:
+    ext = font_path.suffix.lower()
+    if ext == ".woff":
+        return read_woff_name_table(font_path)
+    return read_ttf_name_table(font_path)
+
+
+def load_asset_manifest(target_dir: Path, policy: dict[str, Any]) -> set[str]:
+    """Return normalized relative paths covered by ASSETS_LICENSES.json or REUSE.toml."""
+    tracked: set[str] = set()
+    manifest_json = target_dir / "ASSETS_LICENSES.json"
+    if manifest_json.is_file():
+        try:
+            data = json.loads(manifest_json.read_text(encoding="utf-8"))
+            assets = data.get("assets", data) if isinstance(data, dict) else []
+            if isinstance(assets, list):
+                for item in assets:
+                    if isinstance(item, dict) and item.get("path"):
+                        tracked.add(str(Path(item["path"])))
+            elif isinstance(assets, dict):
+                for path_key in assets.keys():
+                    tracked.add(str(Path(path_key)))
+        except (OSError, json.JSONDecodeError):
+            pass
+
+    reuse_toml = target_dir / "REUSE.toml"
+    if reuse_toml.is_file():
+        try:
+            text = reuse_toml.read_text(encoding="utf-8", errors="ignore")
+            for m in re.finditer(r'path\s*=\s*"([^"]+)"', text):
+                tracked.add(str(Path(m.group(1))))
+        except OSError:
+            pass
+
+    return tracked
+
+
+def scan_assets_and_cdns(
+    target_dir: Path, policy: dict[str, Any], require_manifest: bool, include_dev: bool = False
+) -> list[Finding]:
+    findings: list[Finding] = []
+    assets_cfg = policy.get("assets", {})
+    cdns_cfg = policy.get("cdns", {})
+    blocked_patterns = [p.upper() for p in policy.get("licenses", {}).get("blocked_patterns", [])]
+
+    ignore_dirs = set(assets_cfg.get("ignore_dirs", []))
+    manifest_exts = {e.lower() for e in assets_cfg.get("require_manifest_for", [])}
+    meta_exts = {e.lower() for e in assets_cfg.get("scan_metadata_for", [])}
+    commercial_font_patterns = [p.upper() for p in assets_cfg.get("commercial_font_patterns", [])]
+    open_font_markers = [p.upper() for p in assets_cfg.get("open_font_markers", [])]
+    tracked_assets = load_asset_manifest(target_dir, policy)
+
+    allowed_hosts = {h.lower() for h in cdns_cfg.get("allowed_hosts", [])}
+    flagged_hosts = {h.lower() for h in cdns_cfg.get("flagged_hosts", [])}
+    code_exts = {".html", ".htm", ".css", ".scss", ".js", ".jsx", ".ts", ".tsx"}
+
+    for root, dirs, files in os.walk(target_dir):
+        root_path = Path(root)
+        dirs[:] = [d for d in dirs if d not in ignore_dirs]
+        rel_dirs = [str((root_path / d).relative_to(target_dir)) for d in dirs]
+        ignored_by_git = get_git_ignored_dirs(target_dir, rel_dirs)
+        if ignored_by_git:
+            dirs[:] = [d for d, rel_d in zip(dirs, rel_dirs) if rel_d not in ignored_by_git]
+
+        for fname in files:
+            fpath = root_path / fname
+            rel = str(fpath.relative_to(target_dir))
+            if is_excluded_path(rel, policy, include_dev):
+                continue
+            ext = fpath.suffix.lower()
+
+            try:
+                # 1. Font binary metadata inspection (.ttf, .otf, .woff)
+                if ext in (".ttf", ".otf", ".woff"):
+                    meta_strings = read_font_name_table(fpath)
+                    joined_upper = " ".join(meta_strings).upper()
+                    blocked_hit = False
+                    for pat in blocked_patterns:
+                        if pat in joined_upper:
+                            findings.append(
+                                Finding(
+                                    severity="BLOCK",
+                                    category="font_metadata",
+                                    target=rel,
+                                    license=pat,
+                                    reason=f"Embedded font metadata matches restricted pattern '{pat}'",
+                                    source="asset-scan",
+                                )
+                            )
+                            blocked_hit = True
+                            break
+                    if (
+                        not blocked_hit
+                        and rel not in tracked_assets
+                        and not any(m in joined_upper for m in open_font_markers)
+                    ):
+                        for cpat in commercial_font_patterns:
+                            if cpat in joined_upper:
+                                findings.append(
+                                    Finding(
+                                        severity="BLOCK",
+                                        category="font_metadata",
+                                        target=rel,
+                                        license=cpat,
+                                        reason=(
+                                            f"Embedded font metadata indicates commercial/proprietary foundry "
+                                            f"('{cpat}') and is not verified in ASSETS_LICENSES.json"
+                                        ),
+                                        source="asset-scan",
+                                    )
+                                )
+                                break
+
+                # 2. Asset provenance manifest check
+                if require_manifest and ext in manifest_exts and rel not in tracked_assets:
+                    findings.append(
+                        Finding(
+                            severity="WARN",
+                            category="asset_provenance",
+                            target=rel,
+                            license="UNTRACKED",
+                            reason="Binary/font/dataset asset is not recorded in ASSETS_LICENSES.json or REUSE.toml",
+                            source="asset-scan",
+                        )
+                    )
+
+                # 3. SVG / CSS / source header license inspection
+                if ext in meta_exts and ext not in (".ttf", ".otf", ".woff"):
+                    try:
+                        snippet = fpath.read_text(encoding="utf-8", errors="ignore")[:8192]
+                    except OSError:
+                        snippet = ""
+                    for m in SPDX_HEADER_RE.finditer(snippet):
+                        lic = m.group(1).strip()
+                        verdict = classify_license(lic, policy)
+                        if verdict:
+                            findings.append(
+                                Finding(
+                                    severity=verdict,
+                                    category="source_header",
+                                    target=rel,
+                                    license=lic,
+                                    reason=f"SPDX header '{lic}' flagged by policy",
+                                    source="asset-scan",
+                                )
+                            )
+                    upper_snip = snippet.upper()
+                    for pat in blocked_patterns:
+                        if pat in upper_snip:
+                            findings.append(
+                                Finding(
+                                    severity="BLOCK",
+                                    category="asset_metadata",
+                                    target=rel,
+                                    license=pat,
+                                    reason=f"File text/header matches restricted pattern '{pat}'",
+                                    source="asset-scan",
+                                )
+                            )
+                            break
+
+                # 4. External CDN / commercial font URL check
+                if ext in code_exts:
+                    try:
+                        text = fpath.read_text(encoding="utf-8", errors="ignore")
+                    except OSError:
+                        continue
+                    for url in set(URL_RE.findall(text)):
+                        try:
+                            parsed = urlparse(url)
+                        except ValueError:
+                            continue
+                        host = (parsed.hostname or "").lower()
+                        if not is_valid_public_host(host) or host in allowed_hosts:
+                            continue
+                        if host in flagged_hosts:
+                            findings.append(
+                                Finding(
+                                    severity="WARN",
+                                    category="external_cdn",
+                                    target=rel,
+                                    license=host,
+                                    reason=f"Commercial/licensed font or icon CDN detected ({url}) — verify active commercial license",
+                                    source="cdn-scan",
+                                )
+                            )
+                        elif parsed.path not in ("", "/") and any(h in url.lower() for h in ASSET_URL_HINTS):
+                            findings.append(
+                                Finding(
+                                    severity="WARN",
+                                    category="external_cdn",
+                                    target=rel,
+                                    license=host,
+                                    reason=f"Unapproved external font/asset URL ({url}) — verify commercial license or self-host",
+                                    source="cdn-scan",
+                                )
+                            )
+            except Exception as exc:
+                findings.append(
+                    Finding(
+                        severity="WARN",
+                        category="scan_error",
+                        target=rel,
+                        license="ERROR",
+                        reason=f"Skipped file due to unexpected scan error: {exc}",
+                        source="asset-scan",
+                    )
+                )
+
+    return findings
+
+
+LICENSELESS_LOCKFILES = {
+    "yarn.lock": ("npm", "node_modules"),
+    "pnpm-lock.yaml": ("npm", "node_modules"),
+    "requirements.txt": ("pypi", ".venv"),
+    "poetry.lock": ("pypi", ".venv"),
+    "uv.lock": ("pypi", ".venv"),
+}
+
+REQ_PIN_RE = re.compile(r"^\s*([A-Za-z0-9_.-]+)\s*(?:==\s*([A-Za-z0-9_.+-]+))?")
+
+
+def detect_coverage_gaps(target_dir: Path, policy: dict[str, Any], include_dev: bool) -> list[dict[str, str]]:
+    """Detect lockfiles/manifests that don't embed licenses and lack local installed packages."""
+    gaps: list[dict[str, str]] = []
+    ignore_dirs = set(policy.get("assets", {}).get("ignore_dirs", []))
+    has_root_venv = (target_dir / ".venv").is_dir() or (target_dir / "venv").is_dir()
+    has_root_nm = (target_dir / "node_modules").is_dir()
+
+    for root, dirs, files in os.walk(target_dir):
+        root_path = Path(root)
+        dirs[:] = [d for d in dirs if d not in ignore_dirs]
+        rel_dirs = [str((root_path / d).relative_to(target_dir)) for d in dirs]
+        ignored_by_git = get_git_ignored_dirs(target_dir, rel_dirs)
+        if ignored_by_git:
+            dirs[:] = [d for d, rel_d in zip(dirs, rel_dirs) if rel_d not in ignored_by_git]
+
+        for fname in sorted(files):
+            if fname not in LICENSELESS_LOCKFILES:
+                continue
+            rel = str((root_path / fname).relative_to(target_dir))
+            if is_excluded_path(rel, policy, include_dev):
+                continue
+            eco, local_dir = LICENSELESS_LOCKFILES[fname]
+            if eco == "npm" and ((root_path / "node_modules").is_dir() or has_root_nm):
+                continue
+            if eco == "pypi" and ((root_path / ".venv").is_dir() or (root_path / "venv").is_dir() or has_root_venv):
+                continue
+            gaps.append(
+                {
+                    "file": rel,
+                    "ecosystem": eco,
+                    "hint": f"No local {local_dir} found; install dependencies or run with --online to resolve via deps.dev",
+                }
+            )
+    return gaps
+
+
+def query_deps_dev_licenses(system: str, name: str, version: str | None = None) -> list[str]:
+    """Query Google's public deps.dev v3 API for SPDX license IDs (stdlib only)."""
+    enc_name = urllib.parse.quote(name, safe="")
+    if version:
+        enc_ver = urllib.parse.quote(version, safe="")
+        url = f"https://api.deps.dev/v3/systems/{system}/packages/{enc_name}/versions/{enc_ver}"
+    else:
+        url = f"https://api.deps.dev/v3/systems/{system}/packages/{enc_name}"
+    req = urllib.request.Request(url, headers={"User-Agent": "dep-guard/0.2"})
+    try:
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError):
+        return []
+
+    if version:
+        return [str(x) for x in (data.get("licenses") or []) if x]
+
+    # Package endpoint: find default version and re-query
+    versions = data.get("versions") or []
+    default_ver = next((v.get("versionKey", {}).get("version") for v in versions if v.get("isDefault")), None)
+    if not default_ver and versions:
+        default_ver = versions[-1].get("versionKey", {}).get("version")
+    if default_ver:
+        return query_deps_dev_licenses(system, name, default_ver)
+    return []
+
+
+def parse_requirements_txt(req_path: Path) -> list[tuple[str, str | None]]:
+    pkgs: list[tuple[str, str | None]] = []
+    try:
+        for line in req_path.read_text(encoding="utf-8", errors="ignore").splitlines():
+            line = line.split("#", 1)[0].strip()
+            if not line or line.startswith(("-", "git+", "http://", "https://", ".")):
+                continue
+            m = REQ_PIN_RE.match(line)
+            if m:
+                pkgs.append((m.group(1), m.group(2)))
+    except OSError:
+        pass
+    return pkgs
+
+
+def parse_package_json_deps(pkg_path: Path, include_dev: bool) -> list[tuple[str, str | None]]:
+    pkgs: list[tuple[str, str | None]] = []
+    try:
+        data = json.loads(pkg_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return pkgs
+    dep_sections = [data.get("dependencies") or {}]
+    if include_dev:
+        dep_sections.append(data.get("devDependencies") or {})
+    for sec in dep_sections:
+        if not isinstance(sec, dict):
+            continue
+        for name, spec in sec.items():
+            ver = None
+            if isinstance(spec, str):
+                cleaned = spec.strip().lstrip("^~=")
+                if re.match(r"^\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.-]+)?$", cleaned):
+                    ver = cleaned
+            pkgs.append((name, ver))
+    return pkgs
+
+
+def resolve_online_deps_dev(
+    target_dir: Path, policy: dict[str, Any], include_dev: bool, max_packages: int = 100
+) -> list[Finding]:
+    """Resolve licenses for unscanned requirements.txt / yarn / pnpm manifests via deps.dev."""
+    findings: list[Finding] = []
+    to_query: list[tuple[str, str, str | None, str]] = []
+    seen_pkgs: set[tuple[str, str]] = set()
+    ignore_dirs = set(policy.get("assets", {}).get("ignore_dirs", []))
+
+    for root, dirs, files in os.walk(target_dir):
+        root_path = Path(root)
+        dirs[:] = [d for d in dirs if d not in ignore_dirs]
+        rel_dirs = [str((root_path / d).relative_to(target_dir)) for d in dirs]
+        ignored_by_git = get_git_ignored_dirs(target_dir, rel_dirs)
+        if ignored_by_git:
+            dirs[:] = [d for d, rel_d in zip(dirs, rel_dirs) if rel_d not in ignored_by_git]
+
+        if "requirements.txt" in files:
+            rel = str((root_path / "requirements.txt").relative_to(target_dir))
+            if not is_excluded_path(rel, policy, include_dev):
+                for name, ver in parse_requirements_txt(root_path / "requirements.txt"):
+                    if ("pypi", name.lower()) not in seen_pkgs:
+                        seen_pkgs.add(("pypi", name.lower()))
+                        to_query.append(("pypi", name, ver, rel))
+
+        if ("yarn.lock" in files or "pnpm-lock.yaml" in files) and "package.json" in files:
+            rel = str((root_path / "package.json").relative_to(target_dir))
+            if not is_excluded_path(rel, policy, include_dev):
+                for name, ver in parse_package_json_deps(root_path / "package.json", include_dev):
+                    if ("npm", name.lower()) not in seen_pkgs:
+                        seen_pkgs.add(("npm", name.lower()))
+                        to_query.append(("npm", name, ver, rel))
+
+    for system, name, ver, source_file in to_query[:max_packages]:
+        licenses = query_deps_dev_licenses(system, name, ver)
+        if not licenses:
+            continue
+        expr = " AND ".join(licenses) if len(licenses) > 1 else licenses[0]
+        verdict = classify_license(expr, policy)
+        if verdict:
+            findings.append(
+                Finding(
+                    severity=verdict,
+                    category="dependency",
+                    target=name,
+                    license=expr,
+                    reason=f"License '{expr}' resolved via deps.dev for {source_file}",
+                    source="deps.dev",
+                )
+            )
+    return findings
+
+
+def init_assets_manifest(target_dir: Path, policy: dict[str, Any]) -> int:
+    assets_cfg = policy.get("assets", {})
+    ignore_dirs = set(assets_cfg.get("ignore_dirs", []))
+    manifest_exts = {e.lower() for e in assets_cfg.get("require_manifest_for", [])} | {".svg"}
+    entries = []
+    for root, dirs, files in os.walk(target_dir):
+        dirs[:] = [d for d in dirs if d not in ignore_dirs]
+        for fname in sorted(files):
+            fpath = Path(root) / fname
+            if fpath.suffix.lower() in manifest_exts:
+                entries.append(
+                    {
+                        "path": str(fpath.relative_to(target_dir)),
+                        "license": "TODO-VERIFY (e.g. OFL-1.1, MIT, CC0-1.0, Commercial)",
+                        "source": "TODO-URL",
+                    }
+                )
+    out_path = target_dir / "ASSETS_LICENSES.json"
+    out_path.write_text(json.dumps({"assets": entries}, indent=2) + "\n", encoding="utf-8")
+    print(f"Wrote {out_path} with {len(entries)} asset entries.")
+    return 0
+
+
+def format_summary(report: dict[str, Any]) -> str:
+    lines: list[str] = []
+    blocks = [f for f in report["findings"] if f["severity"] == "BLOCK"]
+    warns = [f for f in report["findings"] if f["severity"] == "WARN"]
+
+    engine = "Trivy + asset-scan" if report["trivy_available"] else "lockfile-fallback + asset-scan"
+    lines.append(f"dep-guard scan ({engine}) -> {len(blocks)} BLOCK, {len(warns)} WARN")
+    if report.get("note"):
+        lines.append(f"  note: {report['note']}")
+
+    if blocks:
+        lines.append("\nBLOCKED (must fix before shipping commercially):")
+        for f in blocks:
+            lines.append(f"  [BLOCK] {f['target']} ({f['license']}) — {f['reason']}")
+
+    if warns:
+        lines.append("\nWARNINGS (review license / provenance):")
+        for f in warns:
+            lines.append(f"  [WARN]  {f['target']} ({f['license']}) — {f['reason']}")
+
+    if not blocks and not warns:
+        lines.append("  All checked dependencies, fonts, assets, and CDNs passed policy.")
+
+    gaps = report.get("coverage_gaps") or []
+    if gaps:
+        lines.append("\nCOVERAGE GAPS (lockfiles without local installed packages):")
+        for g in gaps:
+            lines.append(f"  [INFO]  {g['file']} ({g['ecosystem']}) — {g['hint']}")
+
+    return "\n".join(lines)
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Deterministic license & asset compliance scanner.")
+    parser.add_argument("target", nargs="?", default=".", help="Directory to scan (default: .)")
+    parser.add_argument("--policy", type=Path, default=None, help="Path to custom policy.json")
+    parser.add_argument("--format", choices=["summary", "json"], default="summary", help="Output format")
+    parser.add_argument("--deep", action="store_true", help="Enable Trivy --license-full file-level scan")
+    parser.add_argument("--no-trivy", action="store_true", help="Skip Trivy and use zero-dependency fallback only")
+    parser.add_argument(
+        "--require-asset-manifest",
+        action="store_true",
+        default=True,
+        help="Warn when fonts/datasets are missing from ASSETS_LICENSES.json or REUSE.toml (default: on)",
+    )
+    parser.add_argument("--no-asset-manifest", action="store_false", dest="require_asset_manifest")
+    parser.add_argument("--include-dev", action="store_true", help="Include devDependencies and test/e2e paths")
+    parser.add_argument(
+        "--online",
+        action="store_true",
+        help="Resolve licenses for unscanned requirements.txt / yarn / pnpm manifests via deps.dev API",
+    )
+    parser.add_argument("--strict", action="store_true", help="Treat WARN findings as exit code 1 as well")
+    parser.add_argument("--init-assets", action="store_true", help="Generate starter ASSETS_LICENSES.json and exit")
+
+    args = parser.parse_args(argv)
+    target_dir = Path(args.target).resolve()
+    if not target_dir.is_dir():
+        print(f"Error: target directory not found: {target_dir}", file=sys.stderr)
+        return 2
+
+    policy = load_policy(args.policy, target_dir)
+    if args.init_assets:
+        return init_assets_manifest(target_dir, policy)
+
+    findings: list[Finding] = []
+    trivy_available = False
+    note: str | None = None
+
+    if not args.no_trivy:
+        trivy_available, trivy_findings, note = run_trivy(
+            target_dir, policy, deep=args.deep, include_dev=args.include_dev
+        )
+        findings.extend(trivy_findings)
+
+    # Always run fast lockfile/manifest scan alongside Trivy (deduplicated below)
+    # so minimal lockfiles without installed node_modules/venvs are still caught.
+    findings.extend(scan_lockfiles_fallback(target_dir, policy, include_dev=args.include_dev))
+
+    findings.extend(
+        scan_assets_and_cdns(
+            target_dir, policy, require_manifest=args.require_asset_manifest, include_dev=args.include_dev
+        )
+    )
+
+    coverage_gaps = detect_coverage_gaps(target_dir, policy, include_dev=args.include_dev)
+    if args.online and coverage_gaps:
+        findings.extend(resolve_online_deps_dev(target_dir, policy, include_dev=args.include_dev))
+        coverage_gaps = []
+
+    # Deduplicate findings cleanly
+    deduped: list[dict[str, Any]] = []
+    seen = set()
+    for f in findings:
+        key = (f.severity, f.category, f.target, f.license)
+        if key not in seen:
+            seen.add(key)
+            deduped.append(asdict(f))
+
+    report = {
+        "target": str(target_dir),
+        "trivy_available": trivy_available,
+        "note": note,
+        "block_count": sum(1 for f in deduped if f["severity"] == "BLOCK"),
+        "warn_count": sum(1 for f in deduped if f["severity"] == "WARN"),
+        "coverage_gaps": coverage_gaps,
+        "findings": deduped,
+    }
+
+    if args.format == "json":
+        print(json.dumps(report, indent=2))
+    else:
+        print(format_summary(report))
+
+    if report["block_count"] > 0:
+        return 1
+    if args.strict and report["warn_count"] > 0:
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
