@@ -1,0 +1,13 @@
+{
+  "name": "falmaz-dep-guard",
+  "owner": {
+    "name": "falmaz"
+  },
+  "plugins": [
+    {
+      "name": "dep-guard",
+      "source": "./",
+      "description": "Deterministic Trivy-backed license, font, asset & CDN compliance guardrails for builders."
+    }
+  ]
+}

@@ -15,32 +15,23 @@ AI coding agents make shipping fast, but a single `CC-BY-NC`, `AGPL`, commercial
 
 ## Get Started
 
-### 1. Install Trivy (optional, recommended)
+### One-Step Install (CLI + Claude Code + Codex + Antigravity + Trivy)
 ```bash
-brew install trivy
+curl -fsSL https://raw.githubusercontent.com/falmaz/dep-guard/main/install.sh | bash
 ```
-*(Without Trivy, `dep-guard` still runs its built-in lockfile, font, SVG, and CDN scanners.)*
+This installs `dep-guard` to `~/.local/share/dep-guard`, links `~/.local/bin/dep-guard`, installs `trivy` via Homebrew if available, and sets up the skill/plugin for **Claude Code**, **Codex**, and **Antigravity**.
 
-### 2. Clone & Install `dep-guard`
+*(Target a single agent or skip Trivy: `... | bash -s -- --cc`, `--codex`, `--agy`, or `--no-trivy`.)*
+
+### Enable Automatic Claude Code Hooks (optional)
 ```bash
-git clone https://github.com/falmaz/dep-guard.git
-cd dep-guard
-./install.sh --all      # CLI + Claude Code + Codex + Antigravity
-# or pick one:
-./install.sh --cc
-./install.sh --codex
-./install.sh --agy
+claude --plugin-dir ~/.local/share/dep-guard
+# or via Claude Code plugin marketplace:
+# /plugin marketplace add falmaz/dep-guard
+# /plugin install dep-guard@falmaz-dep-guard
 ```
 
-### 3. Use With Your Coding Agent
-- **Claude Code (automatic `PostToolUse` hooks + skill):**
-  ```bash
-  claude --plugin-dir /path/to/dep-guard
-  ```
-- **Codex CLI:** skill is installed to `~/.codex/skills/dep-guard/SKILL.md`; optionally append [`adapters/codex/AGENTS.md`](./adapters/codex/AGENTS.md) to your project's `AGENTS.md`.
-- **Antigravity (`agy`):** native plugin is installed to `~/.gemini/config/plugins/dep-guard/` (includes `Stop` hook, skill, and `AGENTS.md` rule).
-
-### 4. Scan Your Project (CLI or CI)
+### Run a Scan (CLI or CI)
 ```bash
 dep-guard .                        # Fast offline scan (dependencies, fonts, assets, CDNs)
 dep-guard --online .               # Also resolve unscanned requirements.txt / yarn / pnpm via deps.dev
@@ -51,7 +42,7 @@ dep-guard --strict .               # Exit 1 on WARN as well as BLOCK
 dep-guard --init-assets .          # Scaffold ASSETS_LICENSES.json for existing fonts/assets
 ```
 
-### 5. Add to GitHub Actions (optional)
+### Add to GitHub Actions (optional)
 ```yaml
 - name: License & Asset Audit
   run: |
